@@ -85,9 +85,59 @@ def omie_call(endpoint: str, call: str, param: dict) -> dict:
 
 # ── Omie: resolver nIdPedido pela chave NF ───────────────────────────────────
 def resolver_pedido_por_nf(nf_numero: str) -> Optional[int]:
-    data = omie_call("produtos/nfconsultar", "ObterNf", {"nNFe": int(nf_numero)})
-    pedido_id = data.get("compl", {}).get("nIdPedido") or data.get("nIdPedido")
-    return int(pedido_id) if pedido_id else None
+    import time
+
+    # Passo 1: ListarNF → pega nIdNF
+    data = omie_call("produtos/nfconsultar", "ListarNF", {
+        "pagina": 1,
+        "registros_por_pagina": 10,
+        "nNFe": int(nf_numero),
+    })
+    nfs = data.get("nfCadastro", [])
+    if not nfs:
+        log.error("ListarNF não retornou registros para NF %s", nf_numero)
+        return None
+
+    nf = nfs[0]
+
+    # Tenta pegar nIdPedido direto (nem sempre vem)
+    pedido_id = (
+        nf.get("compl", {}).get("nIdPedido")
+        or nf.get("nIdPedido")
+    )
+    if pedido_id and int(pedido_id) > 0:
+        log.info("nIdPedido resolvido direto do ListarNF: %s", pedido_id)
+        return int(pedido_id)
+
+    # Passo 2: pega nIdNF e chama ConsultarNF para resolver nIdPedido
+    n_id_nf = (
+        nf.get("nIdNF")
+        or nf.get("compl", {}).get("nIdNF")
+        or nf.get("cabecalho", {}).get("nIdNF")
+    )
+    if not n_id_nf:
+        log.error("nIdNF não encontrado na resposta do ListarNF para NF %s", nf_numero)
+        return None
+
+    log.info("nIdNF=%s — consultando NF para resolver nIdPedido", n_id_nf)
+    time.sleep(1)
+
+    data2 = omie_call("produtos/nfconsultar", "ConsultarNF", {
+        "nIdNF": int(n_id_nf),
+    })
+
+    pedido_id = (
+        data2.get("compl", {}).get("nIdPedido")
+        or data2.get("nIdPedido")
+        or data2.get("cabecalho", {}).get("nIdPedido")
+    )
+
+    if pedido_id and int(pedido_id) > 0:
+        log.info("nIdPedido resolvido via ConsultarNF: %s", pedido_id)
+        return int(pedido_id)
+
+    log.error("nIdPedido não encontrado nem via ConsultarNF para NF %s (nIdNF=%s)", nf_numero, n_id_nf)
+    return None
 
 # ── Omie: trocar etapa ────────────────────────────────────────────────────────
 def trocar_etapa(n_id_pedido: int, etapa: int) -> dict:
