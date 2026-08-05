@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: baixa-expedicao
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    envVars:
+      - key: OMIE_APP_KEY
+        sync: false
+      - key: OMIE_APP_SECRET
+        sync: false
+      - key: TOKEN_BAIXA
+        sync: false
+      - key: SHEETS_ID
+        sync: false
+      - key: SHEETS_ABA
+        value: Log_Baixas
+      - key: GOOGLE_CREDS_JSON
+        sync: false
