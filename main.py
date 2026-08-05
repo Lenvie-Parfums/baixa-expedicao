@@ -1,5 +1,5 @@
 """
-baixa-expedicao — Render (FastAPI)
+baixa-expedicao — Render (Flask)
 Recebe POST do AppSheet (bipagem de NF), resolve o pedido no Omie
 e muda a etapa para 70 (Pedido Enviado). Grava log no Google Sheets.
 """
@@ -7,14 +7,14 @@ e muda a etapa para 70 (Pedido Enviado). Grava log no Google Sheets.
 import os
 import logging
 import asyncio
+import threading
 import re
 import json
 from collections import deque
 from typing import Optional
 from datetime import datetime
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
-from pydantic import BaseModel
+from flask import Flask, request, jsonify
 import httpx
 import gspread
 from google.oauth2.service_account import Credentials
@@ -38,7 +38,7 @@ ETAPA_DESTINO = 70  # Pedido Enviado
 _processadas: deque = deque(maxlen=2000)
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI()
+app = Flask(__name__)
 
 # ── Google Sheets client (lazy) ───────────────────────────────────────────────
 _sheets_client = None
@@ -52,21 +52,9 @@ def get_sheets_client():
         _sheets_client = gspread.authorize(creds)
     return _sheets_client
 
-# ── Schema ────────────────────────────────────────────────────────────────────
-class BaixaPayload(BaseModel):
-    nf_chave: str
-    nf_numero: Optional[str]      = None
-    transportadora: Optional[str] = None
-    nome_motorista: Optional[str] = None
-    cpf_motorista: Optional[str]  = None
-    placa: Optional[str]          = None
-    operador: Optional[str]       = None
-
-    class Config:
-        extra = "ignore"
-
-# ── Omie: retry wrapper ───────────────────────────────────────────────────────
-async def omie_call(client: httpx.AsyncClient, endpoint: str, call: str, param: dict) -> dict:
+# ── Omie: retry wrapper (síncrono) ────────────────────────────────────────────
+def omie_call(endpoint: str, call: str, param: dict) -> dict:
+    import time
     url = f"{OMIE_BASE_URL}/{endpoint}/"
     body = {
         "call": call,
@@ -76,7 +64,7 @@ async def omie_call(client: httpx.AsyncClient, endpoint: str, call: str, param: 
     }
     for tentativa in range(4):
         try:
-            r = await client.post(url, json=body, timeout=60)
+            r = httpx.post(url, json=body, timeout=60)
             data = r.json()
             fault = data.get("faultstring", "")
             if not fault:
@@ -85,33 +73,31 @@ async def omie_call(client: httpx.AsyncClient, endpoint: str, call: str, param: 
             wait = int(match.group(1)) + 5 if match else 56
             if "REDUNDANT" in fault or "Consumo redundante" in fault:
                 log.warning("Rate limit Omie — aguardando %ds", wait)
-                await asyncio.sleep(wait)
+                time.sleep(wait)
                 continue
             if "MISUSE_API_PROCESS" in fault or "bloqueada" in fault.lower():
                 raise RuntimeError(f"Omie bloqueado: {fault}")
             raise RuntimeError(f"Omie faultstring: {fault}")
         except (httpx.TimeoutException, httpx.ReadError) as e:
             log.warning("Timeout Omie (tentativa %d): %s", tentativa + 1, e)
-            await asyncio.sleep(10 * (tentativa + 1))
+            time.sleep(10 * (tentativa + 1))
     raise RuntimeError("Omie não respondeu após 4 tentativas")
 
 # ── Omie: resolver nIdPedido pela chave NF ───────────────────────────────────
-async def resolver_pedido_por_nf(client: httpx.AsyncClient, nf_numero: str) -> Optional[int]:
-    data = await omie_call(client, "produtos/nfconsultar", "ObterNf", {
-        "nNFe": int(nf_numero),
-    })
+def resolver_pedido_por_nf(nf_numero: str) -> Optional[int]:
+    data = omie_call("produtos/nfconsultar", "ObterNf", {"nNFe": int(nf_numero)})
     pedido_id = data.get("compl", {}).get("nIdPedido") or data.get("nIdPedido")
     return int(pedido_id) if pedido_id else None
 
 # ── Omie: trocar etapa ────────────────────────────────────────────────────────
-async def trocar_etapa(client: httpx.AsyncClient, n_id_pedido: int, etapa: int) -> dict:
-    return await omie_call(client, "produtos/pedido", "TrocarEtapaPedido", {
+def trocar_etapa(n_id_pedido: int, etapa: int) -> dict:
+    return omie_call("produtos/pedido", "TrocarEtapaPedido", {
         "codigo_pedido": n_id_pedido,
         "etapa": str(etapa).zfill(2),
     })
 
 # ── Google Sheets: gravar log ─────────────────────────────────────────────────
-def gravar_log(payload: BaixaPayload, n_id_pedido: Optional[int], status: str, obs: str = ""):
+def gravar_log(payload: dict, n_id_pedido: Optional[int], status: str, obs: str = ""):
     try:
         gc = get_sheets_client()
         sh = gc.open_by_key(SHEETS_ID)
@@ -126,29 +112,30 @@ def gravar_log(payload: BaixaPayload, n_id_pedido: Optional[int], status: str, o
             ])
         ws.append_row([
             datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-            payload.nf_chave,
-            payload.nf_numero or "",
+            payload.get("nf_chave", ""),
+            payload.get("nf_numero", ""),
             str(n_id_pedido or ""),
             str(ETAPA_DESTINO),
-            payload.transportadora or "",
-            payload.nome_motorista or "",
-            payload.cpf_motorista or "",
-            payload.placa or "",
-            payload.operador or "",
+            payload.get("transportadora", ""),
+            payload.get("nome_motorista", ""),
+            payload.get("cpf_motorista", ""),
+            payload.get("placa", ""),
+            payload.get("operador", ""),
             status,
             obs,
         ])
-        log.info("Log gravado no Sheets: NF %s → %s", payload.nf_numero, status)
+        log.info("Log gravado: NF %s → %s", payload.get("nf_numero"), status)
     except Exception as e:
         log.error("Falha ao gravar log no Sheets: %s", e)
 
-# ── Processamento em background ───────────────────────────────────────────────
-async def processar_baixa(payload: BaixaPayload):
-    nf_numero = payload.nf_numero
-    if not nf_numero and len(payload.nf_chave) >= 34:
-        nf_numero = str(int(payload.nf_chave[25:34]))
+# ── Processamento em background (thread) ──────────────────────────────────────
+def processar_baixa(payload: dict):
+    nf_chave  = payload.get("nf_chave", "")
+    nf_numero = payload.get("nf_numero") or (
+        str(int(nf_chave[25:34])) if len(nf_chave) >= 34 else None
+    )
 
-    chave_dedup = payload.nf_chave.strip()
+    chave_dedup = nf_chave.strip()
     if chave_dedup in _processadas:
         log.info("NF %s já processada — ignorando", nf_numero)
         return
@@ -156,32 +143,40 @@ async def processar_baixa(payload: BaixaPayload):
 
     n_id_pedido = None
     try:
-        async with httpx.AsyncClient() as client:
-            n_id_pedido = await resolver_pedido_por_nf(client, nf_numero)
-            if not n_id_pedido:
-                msg = f"nIdPedido não encontrado para NF {nf_numero}"
-                log.error(msg)
-                gravar_log(payload, None, "ERRO", msg)
-                return
-            await trocar_etapa(client, n_id_pedido, ETAPA_DESTINO)
-            log.info("Pedido %s → etapa %d OK (NF %s)", n_id_pedido, ETAPA_DESTINO, nf_numero)
-            gravar_log(payload, n_id_pedido, "OK")
+        n_id_pedido = resolver_pedido_por_nf(nf_numero)
+        if not n_id_pedido:
+            msg = f"nIdPedido não encontrado para NF {nf_numero}"
+            log.error(msg)
+            gravar_log(payload, None, "ERRO", msg)
+            return
+        trocar_etapa(n_id_pedido, ETAPA_DESTINO)
+        log.info("Pedido %s → etapa %d OK (NF %s)", n_id_pedido, ETAPA_DESTINO, nf_numero)
+        gravar_log(payload, n_id_pedido, "OK")
     except Exception as e:
         log.error("Erro ao processar NF %s: %s", nf_numero, e)
         gravar_log(payload, n_id_pedido, "ERRO", str(e))
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+def health():
+    return jsonify({"status": "ok"})
 
 @app.post("/baixa")
-async def baixa(request: Request, background_tasks: BackgroundTasks):
+def baixa():
     token = request.headers.get("X-Token", "")
     if token != TOKEN_BAIXA:
-        raise HTTPException(status_code=401, detail="Token inválido")
+        return jsonify({"erro": "Token inválido"}), 401
 
-    body = await request.json()
-    payload = BaixaPayload(**body)
-    background_tasks.add_task(processar_baixa, payload)
-    return {"status": "recebido", "nf": payload.nf_numero or payload.nf_chave[:10] + "..."}
+    payload = request.get_json(force=True)
+    if not payload or not payload.get("nf_chave"):
+        return jsonify({"erro": "nf_chave obrigatório"}), 400
+
+    # responde 200 imediatamente — processa em thread
+    t = threading.Thread(target=processar_baixa, args=(payload,), daemon=True)
+    t.start()
+
+    nf_ref = payload.get("nf_numero") or payload["nf_chave"][:10] + "..."
+    return jsonify({"status": "recebido", "nf": nf_ref})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
