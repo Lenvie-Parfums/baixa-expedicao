@@ -87,56 +87,62 @@ def omie_call(endpoint: str, call: str, param: dict) -> dict:
 def resolver_pedido_por_nf(nf_numero: str) -> Optional[int]:
     import time
 
-    # Passo 1: ListarNF → pega nIdNF
-    data = omie_call("produtos/nfconsultar", "ListarNF", {
-        "pagina": 1,
-        "registros_por_pagina": 10,
-        "nNFe": int(nf_numero),
+    # Documentação oficial: ConsultarNF aceita nfChave com campo nNF (número da NF)
+    # Ref: github.com/omiexperience/api-examples/blob/master/php/nfconsultar/NFConsultarSoapClient.php
+    log.info("ConsultarNF com nNF=%s", nf_numero)
+    data = omie_call("produtos/nfconsultar", "ConsultarNF", {
+        "nNF": str(nf_numero),
     })
-    nfs = data.get("nfCadastro", [])
-    if not nfs:
-        log.error("ListarNF não retornou registros para NF %s", nf_numero)
-        return None
 
-    nf = nfs[0]
-
-    # Tenta pegar nIdPedido direto (nem sempre vem)
+    # Tenta extrair nIdPedido de onde quer que venha na resposta
     pedido_id = (
-        nf.get("compl", {}).get("nIdPedido")
-        or nf.get("nIdPedido")
+        data.get("compl", {}).get("nIdPedido")
+        or data.get("nIdPedido")
+        or data.get("cabecalho", {}).get("nIdPedido")
+        or data.get("nfEmitInt", {}).get("nIdPedido")
     )
     if pedido_id and int(pedido_id) > 0:
-        log.info("nIdPedido resolvido direto do ListarNF: %s", pedido_id)
+        log.info("nIdPedido %s resolvido via ConsultarNF (NF %s)", pedido_id, nf_numero)
         return int(pedido_id)
 
-    # Passo 2: pega nIdNF e chama ConsultarNF para resolver nIdPedido
-    n_id_nf = (
-        nf.get("nIdNF")
-        or nf.get("compl", {}).get("nIdNF")
-        or nf.get("cabecalho", {}).get("nIdNF")
-    )
-    if not n_id_nf:
-        log.error("nIdNF não encontrado na resposta do ListarNF para NF %s", nf_numero)
-        return None
-
-    log.info("nIdNF=%s — consultando NF para resolver nIdPedido", n_id_nf)
+    # Fallback: se não veio nIdPedido, tenta via ListarNF filtrado por data de hoje
+    # e varre as notas comparando o número
+    log.warning("ConsultarNF não retornou nIdPedido para NF %s — tentando ListarNF", nf_numero)
     time.sleep(1)
 
-    data2 = omie_call("produtos/nfconsultar", "ConsultarNF", {
-        "nIdNF": int(n_id_nf),
-    })
+    from datetime import date, timedelta
+    hoje = date.today().strftime("%d/%m/%Y")
+    ontem = (date.today() - timedelta(days=1)).strftime("%d/%m/%Y")
 
-    pedido_id = (
-        data2.get("compl", {}).get("nIdPedido")
-        or data2.get("nIdPedido")
-        or data2.get("cabecalho", {}).get("nIdPedido")
-    )
+    for data_ini in [hoje, ontem]:
+        param = {
+            "pagina": 1,
+            "registros_por_pagina": 50,
+            "tpNF": "1",
+            "dEmiInicial": data_ini,
+            "dEmiFinal":   hoje,
+        }
+        resp = omie_call("produtos/nfconsultar", "ListarNF", param)
+        nfs  = resp.get("nfCadastro", [])
 
-    if pedido_id and int(pedido_id) > 0:
-        log.info("nIdPedido resolvido via ConsultarNF: %s", pedido_id)
-        return int(pedido_id)
+        for nf in nfs:
+            num = (
+                nf.get("ide", {}).get("nNF")
+                or nf.get("compl", {}).get("nNF")
+                or ""
+            )
+            if str(num).strip() == str(nf_numero).strip():
+                pedido_id2 = (
+                    nf.get("compl", {}).get("nIdPedido")
+                    or nf.get("nIdPedido")
+                )
+                if pedido_id2 and int(pedido_id2) > 0:
+                    log.info("nIdPedido %s resolvido via ListarNF (NF %s)", pedido_id2, nf_numero)
+                    return int(pedido_id2)
 
-    log.error("nIdPedido não encontrado nem via ConsultarNF para NF %s (nIdNF=%s)", nf_numero, n_id_nf)
+        time.sleep(1)
+
+    log.error("nIdPedido não resolvido para NF %s após todas as tentativas", nf_numero)
     return None
 
 # ── Omie: trocar etapa ────────────────────────────────────────────────────────
