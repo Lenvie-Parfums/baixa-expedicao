@@ -1,12 +1,11 @@
-
-baixa-expedicao — Render (Flask)
-Recebe POST do AppSheet (bipagem de NF), resolve o pedido no Omie
+"""
+baixa-expedicao - Render (Flask)
+Recebe POST do Apps Script (bipagem de NF), resolve o pedido no Omie
 e muda a etapa para 70 (Pedido Enviado). Grava log no Google Sheets.
 """
 
 import os
 import logging
-import asyncio
 import threading
 import re
 import json
@@ -19,11 +18,11 @@ import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config via env ────────────────────────────────────────────────────────────
+# Config via env
 OMIE_APP_KEY      = os.environ["OMIE_APP_KEY"]
 OMIE_APP_SECRET   = os.environ["OMIE_APP_SECRET"]
 OMIE_BASE_URL     = "https://app.omie.com.br/api/v1"
@@ -34,13 +33,12 @@ GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
 ETAPA_DESTINO = 70  # Pedido Enviado
 
-# ── Dedup em memória ──────────────────────────────────────────────────────────
+# Dedup em memoria
 _processadas: deque = deque(maxlen=2000)
 
-# ── App ───────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# ── Google Sheets client (lazy) ───────────────────────────────────────────────
+# Google Sheets client (lazy)
 _sheets_client = None
 
 def get_sheets_client():
@@ -52,10 +50,10 @@ def get_sheets_client():
         _sheets_client = gspread.authorize(creds)
     return _sheets_client
 
-# ── Omie: retry wrapper (síncrono) ────────────────────────────────────────────
+# Omie: retry wrapper
 def omie_call(endpoint: str, call: str, param: dict) -> dict:
     import time
-    url = f"{OMIE_BASE_URL}/{endpoint}/"
+    url = "{}/{}/".format(OMIE_BASE_URL, endpoint)
     body = {
         "call": call,
         "app_key": OMIE_APP_KEY,
@@ -72,29 +70,26 @@ def omie_call(endpoint: str, call: str, param: dict) -> dict:
             match = re.search(r"Aguarde (\d+) segundos", fault)
             wait = int(match.group(1)) + 5 if match else 56
             if "REDUNDANT" in fault or "Consumo redundante" in fault:
-                log.warning("Rate limit Omie — aguardando %ds", wait)
+                log.warning("Rate limit Omie - aguardando %ds", wait)
                 time.sleep(wait)
                 continue
             if "MISUSE_API_PROCESS" in fault or "bloqueada" in fault.lower():
-                raise RuntimeError(f"Omie bloqueado: {fault}")
-            raise RuntimeError(f"Omie faultstring: {fault}")
+                raise RuntimeError("Omie bloqueado: {}".format(fault))
+            raise RuntimeError("Omie faultstring: {}".format(fault))
         except (httpx.TimeoutException, httpx.ReadError) as e:
             log.warning("Timeout Omie (tentativa %d): %s", tentativa + 1, e)
             time.sleep(10 * (tentativa + 1))
-    raise RuntimeError("Omie não respondeu após 4 tentativas")
+    raise RuntimeError("Omie nao respondeu apos 4 tentativas")
 
-# ── Omie: resolver nIdPedido pela chave NF ───────────────────────────────────
+# Omie: resolver nIdPedido pela NF
 def resolver_pedido_por_nf(nf_numero: str) -> Optional[int]:
     import time
 
-    # Documentação oficial: ConsultarNF aceita nfChave com campo nNF (número da NF)
-    # Ref: github.com/omiexperience/api-examples/blob/master/php/nfconsultar/NFConsultarSoapClient.php
     log.info("ConsultarNF com nNF=%s", nf_numero)
     data = omie_call("produtos/nfconsultar", "ConsultarNF", {
         "nNF": str(nf_numero),
     })
 
-    # Tenta extrair nIdPedido de onde quer que venha na resposta
     pedido_id = (
         data.get("compl", {}).get("nIdPedido")
         or data.get("nIdPedido")
@@ -105,9 +100,7 @@ def resolver_pedido_por_nf(nf_numero: str) -> Optional[int]:
         log.info("nIdPedido %s resolvido via ConsultarNF (NF %s)", pedido_id, nf_numero)
         return int(pedido_id)
 
-    # Fallback: se não veio nIdPedido, tenta via ListarNF filtrado por data de hoje
-    # e varre as notas comparando o número
-    log.warning("ConsultarNF não retornou nIdPedido para NF %s — tentando ListarNF", nf_numero)
+    log.warning("ConsultarNF nao retornou nIdPedido para NF %s - tentando ListarNF", nf_numero)
     time.sleep(1)
 
     from datetime import date, timedelta
@@ -120,10 +113,10 @@ def resolver_pedido_por_nf(nf_numero: str) -> Optional[int]:
             "registros_por_pagina": 50,
             "tpNF": "1",
             "dEmiInicial": data_ini,
-            "dEmiFinal":   hoje,
+            "dEmiFinal": hoje,
         }
         resp = omie_call("produtos/nfconsultar", "ListarNF", param)
-        nfs  = resp.get("nfCadastro", [])
+        nfs = resp.get("nfCadastro", [])
 
         for nf in nfs:
             num = (
@@ -142,17 +135,17 @@ def resolver_pedido_por_nf(nf_numero: str) -> Optional[int]:
 
         time.sleep(1)
 
-    log.error("nIdPedido não resolvido para NF %s após todas as tentativas", nf_numero)
+    log.error("nIdPedido nao resolvido para NF %s apos todas as tentativas", nf_numero)
     return None
 
-# ── Omie: trocar etapa ────────────────────────────────────────────────────────
+# Omie: trocar etapa
 def trocar_etapa(n_id_pedido: int, etapa: int) -> dict:
     return omie_call("produtos/pedido", "TrocarEtapaPedido", {
         "codigo_pedido": n_id_pedido,
         "etapa": str(etapa).zfill(2),
     })
 
-# ── Google Sheets: gravar log ─────────────────────────────────────────────────
+# Google Sheets: gravar log
 def gravar_log(payload: dict, n_id_pedido: Optional[int], status: str, obs: str = ""):
     try:
         gc = get_sheets_client()
@@ -162,7 +155,7 @@ def gravar_log(payload: dict, n_id_pedido: Optional[int], status: str, obs: str 
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=SHEETS_ABA, rows=1000, cols=12)
             ws.append_row([
-                "Timestamp", "NF Chave", "NF Número", "nIdPedido",
+                "Timestamp", "NF Chave", "NF Numero", "nIdPedido",
                 "Etapa", "Transportadora", "Motorista", "CPF", "Placa",
                 "Operador", "Status", "Obs"
             ])
@@ -180,20 +173,21 @@ def gravar_log(payload: dict, n_id_pedido: Optional[int], status: str, obs: str 
             status,
             obs,
         ])
-        log.info("Log gravado: NF %s → %s", payload.get("nf_numero"), status)
+        log.info("Log gravado: NF %s -> %s", payload.get("nf_numero"), status)
     except Exception as e:
         log.error("Falha ao gravar log no Sheets: %s", e, exc_info=True)
 
-# ── Processamento em background (thread) ──────────────────────────────────────
+# Processamento em background
 def processar_baixa(payload: dict):
-    nf_chave  = payload.get("nf_chave", "")
+    nf_chave = payload.get("nf_chave", "")
     nf_numero = payload.get("nf_numero") or (
         str(int(nf_chave[25:34])) if len(nf_chave) >= 34 else None
     )
 
-    chave_dedup = nf_chave.strip()
+    # dedup por nf_numero quando nf_chave vazio
+    chave_dedup = nf_chave.strip() or str(nf_numero)
     if chave_dedup in _processadas:
-        log.info("NF %s já processada — ignorando", nf_numero)
+        log.info("NF %s ja processada - ignorando", nf_numero)
         return
     _processadas.append(chave_dedup)
 
@@ -201,18 +195,18 @@ def processar_baixa(payload: dict):
     try:
         n_id_pedido = resolver_pedido_por_nf(nf_numero)
         if not n_id_pedido:
-            msg = f"nIdPedido não encontrado para NF {nf_numero}"
+            msg = "nIdPedido nao encontrado para NF {}".format(nf_numero)
             log.error(msg)
             gravar_log(payload, None, "ERRO", msg)
             return
         trocar_etapa(n_id_pedido, ETAPA_DESTINO)
-        log.info("Pedido %s → etapa %d OK (NF %s)", n_id_pedido, ETAPA_DESTINO, nf_numero)
+        log.info("Pedido %s -> etapa %d OK (NF %s)", n_id_pedido, ETAPA_DESTINO, nf_numero)
         gravar_log(payload, n_id_pedido, "OK")
     except Exception as e:
         log.error("Erro ao processar NF %s: %s", nf_numero, e)
         gravar_log(payload, n_id_pedido, "ERRO", str(e))
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# Endpoints
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
@@ -221,17 +215,16 @@ def health():
 def baixa():
     token = request.headers.get("X-Token", "")
     if token != TOKEN_BAIXA:
-        return jsonify({"erro": "Token inválido"}), 401
+        return jsonify({"erro": "Token invalido"}), 401
 
     payload = request.get_json(force=True)
-    if not payload or not payload.get("nf_chave"):
-        return jsonify({"erro": "nf_chave obrigatório"}), 400
+    if not payload or (not payload.get("nf_chave") and not payload.get("nf_numero")):
+        return jsonify({"erro": "nf_chave ou nf_numero obrigatorio"}), 400
 
-    # responde 200 imediatamente — processa em thread
     t = threading.Thread(target=processar_baixa, args=(payload,), daemon=True)
     t.start()
 
-    nf_ref = payload.get("nf_numero") or payload["nf_chave"][:10] + "..."
+    nf_ref = payload.get("nf_numero") or (payload.get("nf_chave", "")[:10] + "...") or "sem-nf"
     return jsonify({"status": "recebido", "nf": nf_ref})
 
 if __name__ == "__main__":
