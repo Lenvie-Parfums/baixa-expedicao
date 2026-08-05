@@ -182,7 +182,7 @@ def gravar_log(payload: dict, n_id_pedido: Optional[int], status: str, obs: str 
         ])
         log.info("Log gravado: NF %s → %s", payload.get("nf_numero"), status)
     except Exception as e:
-        log.error("Falha ao gravar log no Sheets: %s", e)
+        log.error("Falha ao gravar log no Sheets: %s", e, exc_info=True)
 
 # ── Processamento em background (thread) ──────────────────────────────────────
 def processar_baixa(payload: dict):
