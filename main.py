@@ -1,4 +1,4 @@
-"""
+
 baixa-expedicao — Render (Flask)
 Recebe POST do AppSheet (bipagem de NF), resolve o pedido no Omie
 e muda a etapa para 70 (Pedido Enviado). Grava log no Google Sheets.
