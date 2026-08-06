@@ -263,7 +263,6 @@ def upload_drive(pdf_bytes: bytes, nome_arquivo: str) -> str:
         fields="id, webViewLink",
         supportsAllDrives=True,
         supportsTeamDrives=True,
-        includeItemsFromAllDrives=True,
     ).execute()
 
     link = file.get("webViewLink", "")
