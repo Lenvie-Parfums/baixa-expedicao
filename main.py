@@ -240,7 +240,7 @@ def gerar_pdf(dados: dict) -> bytes:
     buf.seek(0)
     return buf.read()
 
-# Upload PDF para o Drive
+# Upload PDF para o Drive (suporta Shared Drive)
 def upload_drive(pdf_bytes: bytes, nome_arquivo: str) -> str:
     creds = get_credentials()
     service = build("drive", "v3", credentials=creds)
@@ -258,7 +258,8 @@ def upload_drive(pdf_bytes: bytes, nome_arquivo: str) -> str:
     file = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id, webViewLink"
+        fields="id, webViewLink",
+        supportsAllDrives=True,
     ).execute()
 
     link = file.get("webViewLink", "")
